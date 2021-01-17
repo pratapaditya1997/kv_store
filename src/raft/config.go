@@ -10,7 +10,6 @@ package raft
 
 import (
 	"log"
-	"math/rand"
 	"runtime"
 	"sync"
 	"testing"
@@ -20,7 +19,7 @@ import (
 	crand "crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"math/big"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,43 +30,21 @@ func randstring(n int) string {
 	return s[0:n]
 }
 
-func makeSeed() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := crand.Int(crand.Reader, max)
-	x := bigx.Int64()
-	return x
-}
-
 type config struct {
 	mu        sync.Mutex
 	t         *testing.T
 	net       *labrpc.Network
 	n         int
+	done      int32 // tell internal threads to die
 	rafts     []*Raft
 	applyErr  []string // from apply channel readers
 	connected []bool   // whether each server is on the net
 	saved     []*Persister
-	endnames  [][]string            // the port file names each sends to
-	logs      []map[int]interface{} // copy of each server's committed entries
-	start     time.Time             // time at which make_config() was called
-	// begin()/end() statistics
-	t0        time.Time // time at which test_test.go called cfg.begin()
-	rpcs0     int       // rpcTotal() at start of test
-	cmds0     int       // number of agreements
-	bytes0    int64
-	maxIndex  int
-	maxIndex0 int
+	endnames  [][]string    // the port file names each sends to
+	logs      []map[int]int // copy of each server's committed entries
 }
 
-var ncpu_once sync.Once
-
 func make_config(t *testing.T, n int, unreliable bool) *config {
-	ncpu_once.Do(func() {
-		if runtime.NumCPU() < 2 {
-			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")
-		}
-		rand.Seed(makeSeed())
-	})
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
 	cfg.t = t
@@ -78,8 +55,7 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 	cfg.connected = make([]bool, cfg.n)
 	cfg.saved = make([]*Persister, cfg.n)
 	cfg.endnames = make([][]string, cfg.n)
-	cfg.logs = make([]map[int]interface{}, cfg.n)
-	cfg.start = time.Now()
+	cfg.logs = make([]map[int]int, cfg.n)
 
 	cfg.setunreliable(unreliable)
 
@@ -87,7 +63,7 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 
 	// create a full set of Rafts.
 	for i := 0; i < cfg.n; i++ {
-		cfg.logs[i] = map[int]interface{}{}
+		cfg.logs[i] = map[int]int{}
 		cfg.start1(i)
 	}
 
@@ -173,28 +149,26 @@ func (cfg *config) start1(i int) {
 	go func() {
 		for m := range applyCh {
 			err_msg := ""
-			if m.CommandValid == false {
-				// ignore other types of ApplyMsg
-			} else {
-				v := m.Command
+			if m.UseSnapshot {
+				// ignore the snapshot
+			} else if v, ok := (m.Command).(int); ok {
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
-					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
+					if old, oldok := cfg.logs[j][m.Index]; oldok && old != v {
 						// some server has already committed a different value for this entry!
 						err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
-							m.CommandIndex, i, m.Command, j, old)
+							m.Index, i, m.Command, j, old)
 					}
 				}
-				_, prevok := cfg.logs[i][m.CommandIndex-1]
-				cfg.logs[i][m.CommandIndex] = v
-				if m.CommandIndex > cfg.maxIndex {
-					cfg.maxIndex = m.CommandIndex
-				}
+				_, prevok := cfg.logs[i][m.Index-1]
+				cfg.logs[i][m.Index] = v
 				cfg.mu.Unlock()
 
-				if m.CommandIndex > 1 && prevok == false {
-					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.CommandIndex)
+				if m.Index > 1 && prevok == false {
+					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.Index)
 				}
+			} else {
+				err_msg = fmt.Sprintf("committed command %v is not an int", m.Command)
 			}
 
 			if err_msg != "" {
@@ -218,21 +192,13 @@ func (cfg *config) start1(i int) {
 	cfg.net.AddServer(i, srv)
 }
 
-func (cfg *config) checkTimeout() {
-	// enforce a two minute real-time limit on each test
-	if !cfg.t.Failed() && time.Since(cfg.start) > 120*time.Second {
-		cfg.t.Fatal("test took longer than 120 seconds")
-	}
-}
-
 func (cfg *config) cleanup() {
 	for i := 0; i < len(cfg.rafts); i++ {
 		if cfg.rafts[i] != nil {
 			cfg.rafts[i].Kill()
 		}
 	}
-	cfg.net.Cleanup()
-	cfg.checkTimeout()
+	atomic.StoreInt32(&cfg.done, 1)
 }
 
 // attach server i to the net.
@@ -285,16 +251,8 @@ func (cfg *config) rpcCount(server int) int {
 	return cfg.net.GetCount(server)
 }
 
-func (cfg *config) rpcTotal() int {
-	return cfg.net.GetTotalCount()
-}
-
 func (cfg *config) setunreliable(unrel bool) {
 	cfg.net.Reliable(!unrel)
-}
-
-func (cfg *config) bytesTotal() int64 {
-	return cfg.net.GetTotalBytes()
 }
 
 func (cfg *config) setlongreordering(longrel bool) {
@@ -305,25 +263,23 @@ func (cfg *config) setlongreordering(longrel bool) {
 // try a few times in case re-elections are needed.
 func (cfg *config) checkOneLeader() int {
 	for iters := 0; iters < 10; iters++ {
-		ms := 450 + (rand.Int63() % 100)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-
+		time.Sleep(500 * time.Millisecond)
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
-				if term, leader := cfg.rafts[i].GetState(); leader {
-					leaders[term] = append(leaders[term], i)
+				if t, leader := cfg.rafts[i].GetState(); leader {
+					leaders[t] = append(leaders[t], i)
 				}
 			}
 		}
 
 		lastTermWithLeader := -1
-		for term, leaders := range leaders {
+		for t, leaders := range leaders {
 			if len(leaders) > 1 {
-				cfg.t.Fatalf("term %d has %d (>1) leaders", term, len(leaders))
+				cfg.t.Fatalf("term %d has %d (>1) leaders", t, len(leaders))
 			}
-			if term > lastTermWithLeader {
-				lastTermWithLeader = term
+			if t > lastTermWithLeader {
+				lastTermWithLeader = t
 			}
 		}
 
@@ -366,7 +322,7 @@ func (cfg *config) checkNoLeader() {
 // how many servers think a log entry is committed?
 func (cfg *config) nCommitted(index int) (int, interface{}) {
 	count := 0
-	var cmd interface{} = nil
+	cmd := -1
 	for i := 0; i < len(cfg.rafts); i++ {
 		if cfg.applyErr[i] != "" {
 			cfg.t.Fatal(cfg.applyErr[i])
@@ -427,11 +383,7 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 // same value, since nCommitted() checks this,
 // as do the threads that read from applyCh.
 // returns index.
-// if retry==true, may submit the command multiple
-// times, in case a leader fails just after Start().
-// if retry==false, calls Start() only once, in order
-// to simplify the early Lab 2B tests.
-func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
+func (cfg *config) one(cmd int, expectedServers int) int {
 	t0 := time.Now()
 	starts := 0
 	for time.Since(t0).Seconds() < 10 {
@@ -462,15 +414,12 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				nd, cmd1 := cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
 					// committed
-					if cmd1 == cmd {
+					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
 						// and it was the command we submitted.
 						return index
 					}
 				}
 				time.Sleep(20 * time.Millisecond)
-			}
-			if retry == false {
-				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 			}
 		} else {
 			time.Sleep(50 * time.Millisecond)
@@ -478,36 +427,4 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 	}
 	cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	return -1
-}
-
-// start a Test.
-// print the Test message.
-// e.g. cfg.begin("Test (2B): RPC counts aren't too high")
-func (cfg *config) begin(description string) {
-	fmt.Printf("%s ...\n", description)
-	cfg.t0 = time.Now()
-	cfg.rpcs0 = cfg.rpcTotal()
-	cfg.bytes0 = cfg.bytesTotal()
-	cfg.cmds0 = 0
-	cfg.maxIndex0 = cfg.maxIndex
-}
-
-// end a Test -- the fact that we got here means there
-// was no failure.
-// print the Passed message,
-// and some performance numbers.
-func (cfg *config) end() {
-	cfg.checkTimeout()
-	if cfg.t.Failed() == false {
-		cfg.mu.Lock()
-		t := time.Since(cfg.t0).Seconds()       // real time
-		npeers := cfg.n                         // number of Raft peers
-		nrpc := cfg.rpcTotal() - cfg.rpcs0      // number of RPC sends
-		nbytes := cfg.bytesTotal() - cfg.bytes0 // number of bytes
-		ncmds := cfg.maxIndex - cfg.maxIndex0   // number of Raft agreements reported
-		cfg.mu.Unlock()
-
-		fmt.Printf("  ... Passed --")
-		fmt.Printf("  %4.1f  %d %4d %7d %4d\n", t, npeers, nrpc, nbytes, ncmds)
-	}
 }
