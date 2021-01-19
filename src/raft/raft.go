@@ -21,11 +21,22 @@ import (
 	"bytes"
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pratapaditya1997/kv_store/src/labgob"
 	"github.com/pratapaditya1997/kv_store/src/labrpc"
+)
+
+type LogEntry struct {
+	Index   int
+	Term    int
+	Command interface{}
+}
+
+const (
+	STATE_CANDIDATE = iota
+	STATE_FOLLOWER
+	STATE_LEADER
 )
 
 //
@@ -45,12 +56,6 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
-type LogEntry struct {
-	Index   int
-	Term    int
-	Command interface{}
-}
-
 //
 // A Go object implementing a single Raft peer.
 //
@@ -59,7 +64,6 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -88,13 +92,7 @@ type Raft struct {
 	chanHeartbeat chan bool
 }
 
-const (
-	STATE_CANDIDATE = iota
-	STATE_FOLLOWER
-	STATE_LEADER
-)
-
-// return currentTerm and whether this server
+// GetState - return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
@@ -349,7 +347,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		reply.Success = true
-		reply.NextTryIndex = args.PrevLogIndex
+		reply.NextTryIndex = args.PrevLogIndex + len(args.Entries)
 
 		// update commitIndex and apply log
 		if rf.commitIndex < args.LeaderCommit {
@@ -451,7 +449,7 @@ func (rf *Raft) broadcastAppendEntries() {
 				args.PrevLogTerm = rf.log[args.PrevLogIndex-baseIndex].Term
 			}
 
-			if rf.nextIndex[server] <= rf.getLastLogTerm() {
+			if rf.nextIndex[server] <= rf.getLastLogIndex() {
 				args.Entries = rf.log[rf.nextIndex[server]-baseIndex:]
 			}
 
@@ -505,13 +503,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 //
 func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-}
-
-func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
-	return z == 1
 }
 
 func (rf *Raft) Run() {
