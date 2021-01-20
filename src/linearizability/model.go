@@ -1,13 +1,10 @@
-package porcupine
-
-import "fmt"
+package linearizability
 
 type Operation struct {
-	ClientId int // optional, unless you want a visualization; zero-indexed
-	Input    interface{}
-	Call     int64 // invocation time
-	Output   interface{}
-	Return   int64 // response time
+	Input  interface{}
+	Call   int64 // invocation time
+	Output interface{}
+	Return int64 // response time
 }
 
 type EventKind bool
@@ -18,10 +15,9 @@ const (
 )
 
 type Event struct {
-	ClientId int // optional, unless you want a visualization; zero-indexed
-	Kind     EventKind
-	Value    interface{}
-	Id       int
+	Kind  EventKind
+	Value interface{}
+	Id    uint
 }
 
 type Model struct {
@@ -40,12 +36,6 @@ type Model struct {
 	// Equality on states. If you are using a simple data type for states,
 	// you can use the `ShallowEqual` function implemented below.
 	Equal func(state1, state2 interface{}) bool
-	// For visualization, describe an operation as a string.
-	// For example, "Get('x') -> 'y'".
-	DescribeOperation func(input interface{}, output interface{}) string
-	// For visualization purposes, describe a state as a string.
-	// For example, "{'x' -> 'y', 'z' -> 'w'}"
-	DescribeState func(state interface{}) string
 }
 
 func NoPartition(history []Operation) [][]Operation {
@@ -59,19 +49,3 @@ func NoPartitionEvent(history []Event) [][]Event {
 func ShallowEqual(state1, state2 interface{}) bool {
 	return state1 == state2
 }
-
-func DefaultDescribeOperation(input interface{}, output interface{}) string {
-	return fmt.Sprintf("%v -> %v", input, output)
-}
-
-func DefaultDescribeState(state interface{}) string {
-	return fmt.Sprintf("%v", state)
-}
-
-type CheckResult string
-
-const (
-	Unknown CheckResult = "Unknown" // timed out
-	Ok                  = "Ok"
-	Illegal             = "Illegal"
-)

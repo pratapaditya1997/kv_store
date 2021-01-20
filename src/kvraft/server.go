@@ -1,15 +1,17 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
+	"bytes"
 	"log"
-	"../raft"
 	"sync"
-	"sync/atomic"
+	"time"
+
+	"github.com/pratapaditya1997/kv_store/src/labgob"
+	"github.com/pratapaditya1997/kv_store/src/labrpc"
+	"github.com/pratapaditya1997/kv_store/src/raft"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +20,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Command   string // get | put | append
+	Key       string
+	Value     string
+	ClientId  int64
+	RequestId int64
 }
 
 type KVServer struct {
@@ -30,20 +36,107 @@ type KVServer struct {
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	data   map[string]string // key-value database
+	ack    map[int64]int64   // client's latest request id (for deduplication)
+	notify map[int]chan Op   // log index to notifying chan (for checking status)
 }
 
+// try to append an entry to raft server's log.
+// return true if raft servers apply this entry before timeout
+func (kv *KVServer) appendEntryToLog(entry Op) bool {
+	index, _, isLeader := kv.rf.Start(entry)
+	if !isLeader {
+		return false
+	}
+
+	kv.mu.Lock()
+	ch, ok := kv.notify[index]
+	if !ok {
+		ch = make(chan Op, 1)
+		kv.notify[index] = ch
+	}
+	kv.mu.Unlock()
+
+	select {
+	case appliedEntry := <-ch:
+		return entry == appliedEntry
+	case <-time.After(240 * time.Millisecond):
+		return false
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	entry := Op{}
+	entry.Command = "get"
+	entry.Key = args.Key
+	entry.ClientId = args.ClientId
+	entry.RequestId = args.RequestId
+
+	ok := kv.appendEntryToLog(entry)
+	if !ok {
+		reply.WrongLeader = true
+		return
+	}
+	reply.WrongLeader = false
+	reply.Err = OK
+	kv.mu.Lock()
+	reply.Value = kv.data[args.Key]
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	entry := Op{}
+	entry.Command = args.Command
+	entry.Key = args.Key
+	entry.Value = args.Value
+	entry.ClientId = args.ClientId
+	entry.RequestId = args.RequestId
+
+	ok := kv.appendEntryToLog(entry)
+	if !ok {
+		reply.WrongLeader = true
+		return
+	}
+	reply.WrongLeader = false
+	reply.Err = OK
+}
+
+// apply operation on database
+func (kv *KVServer) applyOp(op Op) {
+	switch op.Command {
+	case "put":
+		kv.data[op.Key] = op.Value
+	case "append":
+		kv.data[op.Key] += op.Value
+	}
+	kv.ack[op.ClientId] = op.RequestId
+}
+
+// apply snapshot on database
+func (kv *KVServer) applySnapshot(snapshot []byte) {
+	var lastIncludedIndex, lastIncludedTerm int
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	d.Decode(&lastIncludedIndex)
+	d.Decode(&lastIncludedTerm)
+	d.Decode(&kv.data)
+	d.Decode(&kv.ack)
+}
+
+// check if the request is duplicated with request id
+func (kv *KVServer) isDuplicate(op Op) bool {
+	latestRequestId, ok := kv.ack[op.ClientId]
+	if ok {
+		return latestRequestId >= op.RequestId
+	}
+	return false
 }
 
 //
@@ -57,14 +150,48 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // to suppress debug output from a Kill()ed instance.
 //
 func (kv *KVServer) Kill() {
-	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
 
-func (kv *KVServer) killed() bool {
-	z := atomic.LoadInt32(&kv.dead)
-	return z == 1
+func (kv *KVServer) Run() {
+	for {
+		msg := <-kv.applyCh
+
+		kv.mu.Lock()
+
+		if msg.UseSnapshot {
+			kv.applySnapshot(msg.Snapshot)
+		} else {
+			op := msg.Command.(Op)
+			if !kv.isDuplicate(op) {
+				kv.applyOp(op)
+			}
+
+			// send success notification (even for duplicate request)
+			ch, ok := kv.notify[msg.CommandIndex]
+			if ok {
+				select {
+				case <-ch:
+				default:
+				}
+			} else {
+				ch = make(chan Op, 1)
+				kv.notify[msg.CommandIndex] = ch
+			}
+			ch <- op
+
+			if kv.maxraftstate != -1 && kv.rf.GetStateSize() > kv.maxraftstate {
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.data)
+				e.Encode(kv.ack)
+				go kv.rf.CreateSnapshot(w.Bytes(), msg.CommandIndex)
+			}
+		}
+
+		kv.mu.Unlock()
+	}
 }
 
 //
@@ -92,10 +219,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 100)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.data = make(map[string]string)
+	kv.ack = make(map[int64]int64)
+	kv.notify = make(map[int]chan Op)
 
+	go kv.Run()
 	return kv
 }
