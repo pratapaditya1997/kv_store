@@ -120,10 +120,10 @@ func (kv *KVServer) applyOp(op Op) {
 
 // apply snapshot on database
 func (kv *KVServer) applySnapshot(snapshot []byte) {
-	var lastIncludedIndex, lastIncludedTerm int
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 
+	var lastIncludedIndex, lastIncludedTerm int
 	d.Decode(&lastIncludedIndex)
 	d.Decode(&lastIncludedTerm)
 	d.Decode(&kv.data)
@@ -165,6 +165,7 @@ func (kv *KVServer) Run() {
 		} else {
 			op := msg.Command.(Op)
 			if !kv.isDuplicate(op) {
+				// apply operation if it is not duplicate request
 				kv.applyOp(op)
 			}
 
@@ -181,7 +182,7 @@ func (kv *KVServer) Run() {
 			}
 			ch <- op
 
-			if kv.maxraftstate != -1 && kv.rf.GetStateSize() > kv.maxraftstate {
+			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
 				w := new(bytes.Buffer)
 				e := labgob.NewEncoder(w)
 				e.Encode(kv.data)
