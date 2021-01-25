@@ -1,34 +1,30 @@
 package shardkv
 
-import "../shardmaster"
-import "../labrpc"
-import "testing"
-import "os"
+import (
+	"os"
 
-// import "log"
-import crand "crypto/rand"
-import "math/big"
-import "math/rand"
-import "encoding/base64"
-import "sync"
-import "runtime"
-import "../raft"
-import "strconv"
-import "fmt"
-import "time"
+	"testing"
+
+	// import "log"
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/rand"
+
+	"runtime"
+	"strconv"
+	"sync"
+
+	"github.com/pratapaditya1997/kv_store/src/labrpc"
+	"github.com/pratapaditya1997/kv_store/src/raft"
+	"github.com/pratapaditya1997/kv_store/src/shardmaster"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
 	crand.Read(b)
 	s := base64.URLEncoding.EncodeToString(b)
 	return s[0:n]
-}
-
-func makeSeed() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := crand.Int(crand.Reader, max)
-	x := bigx.Int64()
-	return x
 }
 
 // Randomize server handles
@@ -51,10 +47,9 @@ type group struct {
 }
 
 type config struct {
-	mu    sync.Mutex
-	t     *testing.T
-	net   *labrpc.Network
-	start time.Time // time at which make_config() was called
+	mu  sync.Mutex
+	t   *testing.T
+	net *labrpc.Network
 
 	nmasters      int
 	masterservers []*shardmaster.ShardMaster
@@ -69,19 +64,10 @@ type config struct {
 	maxraftstate int
 }
 
-func (cfg *config) checkTimeout() {
-	// enforce a two minute real-time limit on each test
-	if !cfg.t.Failed() && time.Since(cfg.start) > 120*time.Second {
-		cfg.t.Fatal("test took longer than 120 seconds")
-	}
-}
-
 func (cfg *config) cleanup() {
 	for gi := 0; gi < cfg.ngroups; gi++ {
 		cfg.ShutdownGroup(gi)
 	}
-	cfg.net.Cleanup()
-	cfg.checkTimeout()
 }
 
 // check that no server's log is too big.
@@ -90,7 +76,7 @@ func (cfg *config) checklogs() {
 		for i := 0; i < cfg.n; i++ {
 			raft := cfg.groups[gi].saved[i].RaftStateSize()
 			snap := len(cfg.groups[gi].saved[i].ReadSnapshot())
-			if cfg.maxraftstate >= 0 && raft > 8*cfg.maxraftstate {
+			if cfg.maxraftstate >= 0 && raft > 2*cfg.maxraftstate {
 				cfg.t.Fatalf("persister.RaftStateSize() %v, but maxraftstate %v",
 					raft, cfg.maxraftstate)
 			}
@@ -337,14 +323,12 @@ func make_config(t *testing.T, n int, unreliable bool, maxraftstate int) *config
 		if runtime.NumCPU() < 2 {
 			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")
 		}
-		rand.Seed(makeSeed())
 	})
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
 	cfg.t = t
 	cfg.maxraftstate = maxraftstate
 	cfg.net = labrpc.MakeNetwork()
-	cfg.start = time.Now()
 
 	// master
 	cfg.nmasters = 3
