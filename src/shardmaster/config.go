@@ -1,17 +1,20 @@
 package shardmaster
 
-import "../labrpc"
-import "../raft"
-import "testing"
-import "os"
+import (
+	"os"
 
-// import "log"
-import crand "crypto/rand"
-import "math/rand"
-import "encoding/base64"
-import "sync"
-import "runtime"
-import "time"
+	"testing"
+
+	"github.com/pratapaditya1997/kv_store/src/labrpc"
+	"github.com/pratapaditya1997/kv_store/src/raft"
+
+	// import "log"
+	crand "crypto/rand"
+	"encoding/base64"
+	"math/rand"
+	"runtime"
+	"sync"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -41,14 +44,6 @@ type config struct {
 	endnames     [][]string // names of each server's sending ClientEnds
 	clerks       map[*Clerk][]string
 	nextClientId int
-	start        time.Time // time at which make_config() was called
-}
-
-func (cfg *config) checkTimeout() {
-	// enforce a two minute real-time limit on each test
-	if !cfg.t.Failed() && time.Since(cfg.start) > 120*time.Second {
-		cfg.t.Fatal("test took longer than 120 seconds")
-	}
 }
 
 func (cfg *config) cleanup() {
@@ -59,8 +54,6 @@ func (cfg *config) cleanup() {
 			cfg.servers[i].Kill()
 		}
 	}
-	cfg.net.Cleanup()
-	cfg.checkTimeout()
 }
 
 // Maximum log size across all servers
@@ -340,7 +333,6 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 	cfg.endnames = make([][]string, cfg.n)
 	cfg.clerks = make(map[*Clerk][]string)
 	cfg.nextClientId = cfg.n + 1000 // client ids start 1000 above the highest serverid
-	cfg.start = time.Now()
 
 	// create a full set of KV servers.
 	for i := 0; i < cfg.n; i++ {
